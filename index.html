@@ -3641,21 +3641,25 @@ async function applyStatusEffect(target, effectInfo) {
     const icon = STATUS_EFFECT_ICONS[effectInfo.id] || '🔗';
 
     if (existingEffectIndex !== -1) {
-        // 1. 이미 동일한 상태 이상이 존재하는 경우 -> 턴 수를 더해줍니다! (중첩)
-        currentEffects[existingEffectIndex].turnsRemaining += effectInfo.turns;
+        // 1. 이미 동일한 상태 이상이 존재하는 경우 -> Number()로 확실하게 숫자로 더해줍니다!
+        currentEffects[existingEffectIndex].turnsRemaining = Number(currentEffects[existingEffectIndex].turnsRemaining) + Number(effectInfo.turns);
 
-        // 혹시 value(출혈 데미지 등)가 같이 들어왔다면 새로운 값으로 덮어씌움
         if (effectInfo.value !== undefined) {
             currentEffects[existingEffectIndex].value = effectInfo.value;
         }
 
+        // DB에 업데이트
         await updateDoc(targetRef, { statusEffects: currentEffects });
+        
+        // ★ [핵심 추가] 스킬 종료 후 옛날 데이터로 덮어씌워지는 것을 막기 위해 로컬 변수도 동기화!
+        target.statusEffects = currentEffects;
+
         await logAction(`${icon} ${target.name}의 [${baseEffect.name}] 효과가 연장되었습니다! (총 ${currentEffects[existingEffectIndex].turnsRemaining}턴 남음)`, "system");
     } else {
-        // 2. 완전히 새로운 상태 이상인 경우 -> 새로 목록에 추가합니다.
+        // 2. 완전히 새로운 상태 이상인 경우
         const newEffect = {
             ...baseEffect, 
-            turnsRemaining: effectInfo.turns,
+            turnsRemaining: Number(effectInfo.turns),
             isNew: true
         };
 
@@ -3664,7 +3668,13 @@ async function applyStatusEffect(target, effectInfo) {
         }
 
         currentEffects.push(newEffect);
+        
+        // DB에 업데이트
         await updateDoc(targetRef, { statusEffects: currentEffects });
+        
+        // ★ [핵심 추가] 로컬 변수 동기화!
+        target.statusEffects = currentEffects;
+
         await logAction(`${icon} ${target.name}이(가) [${baseEffect.name}] 효과를 받았습니다! (${newEffect.turnsRemaining}턴 지속)`, "system");
     }
 }
@@ -4179,18 +4189,19 @@ function triggerWallDestructionEffect(x, y) {
         }
         // ▲▲▲ 이은정 궁극기 로직 끝 ▲▲▲
 
-        // ▼▼▼ [수정] 고요한 궁극기: 靑出 ▼▼▼
+        // ▼▼▼ [수정] 고요한 궁극기: 靑出 (효과 및 패널티 개편) ▼▼▼
         else if (skillId === 'cheongchul') {
 
-            // 현재 체력에서 1을 뺀 값 = 적에게 줄 데미지이자 본인이 잃을 체력
-            const hpReduced = attacker.hp - 1;
+            // 1. 스킬 위력 및 반동 수치 계산
+            const damageToDeal = attacker.hp; // 적에게 줄 데미지: 시전자의 '현재 체력' 전체
+            const hpToLose = Math.floor(attacker.hp / 2); // 잃을 체력: 현재 체력의 절반 (소수점 버림)
             
-            if (hpReduced <= 0) {
-                await logAction(`⚠️ 이미 체력이 1이라 힘을 끌어낼 수 없습니다!`, "system");
+            if (damageToDeal <= 0) {
+                await logAction(`⚠️ 체력이 부족하여 힘을 끌어낼 수 없습니다!`, "system");
                 return;
             }
 
-            // 1. 패널티 처리 (임새언 앵콜 버프 확인)
+            // 2. 패널티 처리 (임새언 앵콜 버프 확인)
             const existingEffects = attacker.statusEffects || [];
             const hasEncore = existingEffects.some(e => e.id === 'encore_buff');
             const saeeon = characters.find(c => c.name === '임새언' && c.hp > 0 && c.type === 'PC');
@@ -4201,27 +4212,38 @@ function triggerWallDestructionEffect(x, y) {
                     statusEffects: existingEffects.filter(e => e.id !== 'encore_buff')
                 });
                 
-                // 임새언에게 생명력 소모 패널티 전가
-                const saeeonNewHp = await updateHP(saeeon, -hpReduced, "damage");
-                await triggerCombatText(saeeon, `-${hpReduced}`, 'damage');
+                // 임새언에게 생명력 감소 및 스탯 하락 패널티 전가
+                const saeeonNewHp = await updateHP(saeeon, -hpToLose, "damage");
+                await triggerCombatText(saeeon, `-${hpToLose}`, 'damage');
                 
-                let saeeonLog = `🎤 [앵콜] 임새언이 ${attacker.name}의 생명력 소모(${hpReduced})를 대신 감당합니다!`;
+                // ★ 주의: 근력 스탯 변수명이 strength 라면 아래 bonusDamage를 strength로 바꿔주세요!
+                await updateDoc(doc(db, 'games', gameId, 'characters', saeeon.id), {
+                    bonusDamage: 1
+                });
+
+                let saeeonLog = `🎤 [앵콜] 임새언이 ${attacker.name}의 치명적인 반동을 대신 감당합니다!`;
                 if (saeeonNewHp === 0) {
                     saeeonLog += `<br>💀 그 치명적인 반동을 버티지 못하고 임새언이 쓰러졌습니다...`;
                 }
                 await logAction(saeeonLog, "system");
             } else {
-                // 버프가 없거나 임새언이 쓰러진 경우 본인이 직접 체력을 1로 깎음
-                await updateHP(attacker, -hpReduced, "damage");
-                await triggerCombatText(attacker, `-${hpReduced}`, 'damage');
-                await logAction(`🔵 ${attacker.name}이(가) 생명력을 깎아 푸른 기운을 뿜어냅니다! (체력 1로 감소)`, "system");
+                // 버프가 없거나 임새언이 쓰러진 경우 본인이 직접 패널티를 받음
+                await updateHP(attacker, -hpToLose, "damage");
+                await triggerCombatText(attacker, `-${hpToLose}`, 'damage');
+                
+                // ★ 주의: 근력 스탯 변수명이 strength 라면 아래 bonusDamage를 strength로 바꿔주세요!
+                await updateDoc(doc(db, 'games', gameId, 'characters', attacker.id), {
+                    bonusDamage: 5
+                });
+                
+                await logAction(`🔵 ${attacker.name}이(가) 생명력과 근력을 깎아 푸른 기운을 뿜어냅니다!`, "system");
             }
 
             await delay(500); // 연출을 위한 약간의 딜레이
 
-            // 2. 적에게 깎인 체력만큼의 고정 데미지를 입힘
-            const newHp = await updateHP(target, -hpReduced, "damage");
-            await triggerCombatText(target, `-${hpReduced}`, 'damage');
+            // 3. 적에게 '현재 체력'만큼의 고정 데미지를 입힘
+            const newHp = await updateHP(target, -damageToDeal, "damage");
+            await triggerCombatText(target, `-${damageToDeal}`, 'damage');
             
             // 타격 애니메이션 (빨간색 번쩍임)
             const defenderToken = document.querySelector(`.character-token[data-char-id="${target.id}"]`);
@@ -4231,7 +4253,7 @@ function triggerWallDestructionEffect(x, y) {
             }
 
             // 로그 출력
-            let message = `💥 [靑出] 발동! ${target.name}에게 **${hpReduced} 고정 피해!**`;
+            let message = `💥 [靑出] 발동! ${target.name}에게 **${damageToDeal} 고정 피해!**`;
             if (newHp === 0) message += `<br>💀 ${target.name}이(가) 쓰러졌습니다!`;
             await logAction(message, "damage");
 
@@ -4673,7 +4695,7 @@ function triggerWallDestructionEffect(x, y) {
         // ▲▲▲ 마음의 밴드 로직 끝 ▲▲▲
 
 
-        // ▼▼▼ [수정] 범지태 궁극기: Sector Clear ▼▼▼
+        // ▼▼▼ [수정] 범지태 궁극기: Sector Clear (임새언 앵콜 버프 적용) ▼▼▼
         else if (skillId === 'sector_clear') {
             if (!target || target.type !== 'ENEMY') {
                 await logAction(`⚠️ 공격할 적을 정확히 지정해야 합니다.`, "system");
@@ -4704,39 +4726,69 @@ function triggerWallDestructionEffect(x, y) {
             
             const splashTargets = nearbyEnemies.slice(0, 2);
 
-            // [수정] 출혈 상태이상을 공식 시스템을 통해 안전하게 부여
+            // 출혈 상태이상을 공식 시스템을 통해 안전하게 부여
             for (const splashEnemy of splashTargets) {
                 await applyStatusEffect(splashEnemy, { id: 'bleeding', turns: 2, value: 5 });
             }
 
-            // 3. 범지태 본인 페널티: 체력 -30 및 스턴 + 도주 불가
-            let jiTaeHp = attacker.hp - 30;
-            let isDead = false;
-            if (jiTaeHp <= 0) {
-                jiTaeHp = 0;
-                isDead = true;
-            }
+            // ▼▼▼ [수정] 3. 패널티 처리 (임새언 앵콜 버프 확인) ▼▼▼
+            const existingEffects = attacker.statusEffects || [];
+            const hasEncore = existingEffects.some(e => e.id === 'encore_buff');
+            const saeeon = characters.find(c => c.name === '임새언' && c.hp > 0 && c.type === 'PC');
 
-            // 체력 깎기
-            await updateDoc(doc(db, 'games', gameId, 'characters', attacker.id), { hp: jiTaeHp });
-            if (typeof triggerCombatText === 'function') await triggerCombatText(attacker, `-30`, 'damage');
-            
-            if (isDead) {
-                await logAction(`💀 ${attacker.name}이(가) 치명적인 반동을 버티지 못하고 쓰러졌습니다...`, "damage");
-            } else {
-                await logAction(`⚠️ 무리한 공격의 반동으로 ${attacker.name}이(가) 체력을 30 잃었습니다!`, "damage");
+            if (hasEncore && saeeon) {
+                // 3-1. 범지태의 앵콜 버프 제거
+                await updateDoc(doc(db, 'games', gameId, 'characters', attacker.id), {
+                    statusEffects: existingEffects.filter(e => e.id !== 'encore_buff')
+                });
                 
-                // [수정] 턴을 2로 늘리고 도주 불가(cannot_flee) 효과를 함께 부여!
-                await applyStatusEffect(attacker, { id: 'stunned', turns: 2 });
-                await applyStatusEffect(attacker, { id: 'cannot_flee', turns: 99 });
-                await logAction(`💫 ${attacker.name}이(가) 1라운드간 행동 불능 및 도주 불가 상태가 됩니다.`, "system");
+                // 3-2. 임새언에게 체력 -30 및 스턴 + 도주 불가 패널티 전가
+                const saeeonNewHp = await updateHP(saeeon, -30, "damage");
+                await triggerCombatText(saeeon, `-30`, 'damage');
+                
+                let saeeonLog = `🎤 [앵콜] 임새언이 ${attacker.name}의 무리한 공격 반동을 대신 짊어집니다! (체력 30 감소)`;
+                if (saeeonNewHp === 0) {
+                    saeeonLog += `<br>💀 치명적인 반동을 버티지 못하고 임새언이 쓰러졌습니다...`;
+                }
+                await logAction(saeeonLog, "damage");
+
+                // 임새언이 살아있을 경우에만 기절 및 도주 불가 적용
+                if (saeeonNewHp > 0) {
+                    await applyStatusEffect(saeeon, { id: 'stunned', turns: 2 });
+                    await applyStatusEffect(saeeon, { id: 'cannot_flee', turns: 99 });
+                    await logAction(`💫 임새언이 1라운드간 행동 불능 및 도주 불가 상태가 됩니다.`, "system");
+                }
+            } else {
+                // 3-3. 버프가 없거나 임새언이 쓰러진 경우 본인이 직접 패널티를 받음
+                let jiTaeHp = attacker.hp - 30;
+                let isDead = false;
+                if (jiTaeHp <= 0) {
+                    jiTaeHp = 0;
+                    isDead = true;
+                }
+
+                // 체력 깎기
+                await updateDoc(doc(db, 'games', gameId, 'characters', attacker.id), { hp: jiTaeHp });
+                if (typeof triggerCombatText === 'function') await triggerCombatText(attacker, `-30`, 'damage');
+                
+                if (isDead) {
+                    await logAction(`💀 ${attacker.name}이(가) 치명적인 반동을 버티지 못하고 쓰러졌습니다...`, "damage");
+                } else {
+                    await logAction(`⚠️ 무리한 공격의 반동으로 ${attacker.name}이(가) 체력을 30 잃었습니다!`, "damage");
+                    
+                    // 턴을 2로 늘리고 도주 불가(cannot_flee) 효과를 함께 부여!
+                    await applyStatusEffect(attacker, { id: 'stunned', turns: 2 });
+                    await applyStatusEffect(attacker, { id: 'cannot_flee', turns: 99 });
+                    await logAction(`💫 ${attacker.name}이(가) 1라운드간 행동 불능 및 도주 불가 상태가 됩니다.`, "system");
+                }
             }
+            // ▲▲▲ 패널티 처리 로직 끝 ▲▲▲
 
             actionSucceeded = true;
         }
         // ▲▲▲ Sector Clear 로직 끝 ▲▲▲
 
-        // ▼▼▼ [추가] 청록 궁극기: 審問 (심문) ▼▼▼
+        // ▼▼▼ [수정] 청록 궁극기: 審問 (심문) (임새언 앵콜 버프 적용) ▼▼▼
         else if (skillId === 'interrogation') {
 
             // 2. 타겟 즉사 처리
@@ -4756,8 +4808,7 @@ function triggerWallDestructionEffect(x, y) {
                     }
                 }
                 
-                // ★ [수정됨] Number()를 씌워서 확실하게 숫자로 계산하도록 강제합니다.
-                // 만약 근력 변수명이 strength라면 아래 두 줄의 bonusDamage를 strength로 바꿔주세요!
+                // Number()를 씌워서 확실하게 숫자로 계산하도록 강제합니다.
                 const currentBonus = Number(maxHpEnemy.bonusDamage) || 0; 
                 const newBonus = currentBonus - 2;
                 
@@ -4768,30 +4819,66 @@ function triggerWallDestructionEffect(x, y) {
                 if (typeof triggerCombatText === 'function') {
                     await triggerCombatText(maxHpEnemy, `공격력 하락!`, 'damage');
                 }
-                await logAction(`📉 처참한 심문 광경에 압도되어, 가장 강한 적 [${maxHpEnemy.name}]의 보너스 데미지가 영구적으로 하락했습니다!`, "system");
+                await logAction(`📉 적 [${maxHpEnemy.name}]의 보너스 데미지가 영구적으로 하락했습니다!`, "system");
             }
 
-            // 4. 청록 본인 페널티 적용 (체력 -20, 민첩 4, 이동력 2 하락)
-            let crNewHp = attacker.hp - 20;
-            let isDead = false;
-            if (crNewHp <= 0) {
-                crNewHp = 0;
-                isDead = true;
-            }
+            // ▼▼▼ [수정] 4. 패널티 처리 (임새언 앵콜 버프 확인) ▼▼▼
+            const existingEffects = attacker.statusEffects || [];
+            const hasEncore = existingEffects.some(e => e.id === 'encore_buff');
+            const saeeon = characters.find(c => c.name === '임새언' && c.hp > 0 && c.type === 'PC');
 
-            await updateDoc(doc(db, 'games', gameId, 'characters', attacker.id), { 
-                hp: crNewHp,
-                agility: 4,
-                moveRange: 2
-            });
-            
-            if (typeof triggerCombatText === 'function') await triggerCombatText(attacker, `-20`, 'damage');
-            
-            if (isDead) {
-                await logAction(`💀 ${attacker.name}이(가) 반동을 버티지 못하고 쓰러졌습니다...`, "damage");
+            if (hasEncore && saeeon) {
+                // 4-1. 청록의 앵콜 버프 제거
+                await updateDoc(doc(db, 'games', gameId, 'characters', attacker.id), {
+                    statusEffects: existingEffects.filter(e => e.id !== 'encore_buff')
+                });
+                
+                // 4-2. 임새언에게 패널티 전가 (체력 -20, 민첩 4, 이동력 2 하락)
+                let saeeonNewHp = saeeon.hp - 20;
+                let isSaeeonDead = false;
+                if (saeeonNewHp <= 0) {
+                    saeeonNewHp = 0;
+                    isSaeeonDead = true;
+                }
+
+                await updateDoc(doc(db, 'games', gameId, 'characters', saeeon.id), { 
+                    hp: saeeonNewHp,
+                    agility: 4,
+                    moveRange: 2
+                });
+                
+                if (typeof triggerCombatText === 'function') await triggerCombatText(saeeon, `-20`, 'damage');
+                
+                let saeeonLog = `🎤 [앵콜] 임새언이 ${attacker.name}의 심문 반동을 대신 감당합니다!`;
+                if (isSaeeonDead) {
+                    saeeonLog += `<br>💀 그 치명적인 반동을 버티지 못하고 임새언이 쓰러졌습니다...`;
+                }
+                await logAction(saeeonLog, "damage");
+
             } else {
-                await logAction(`🩸 ${attacker.name}이(가) 심문의 대가로 체력 20을 잃고, 스탯이 영구적으로 하락했습니다.`, "damage");
+                // 4-3. 버프가 없거나 임새언이 쓰러진 경우 본인이 직접 패널티를 받음
+                let crNewHp = attacker.hp - 20;
+                let isDead = false;
+                if (crNewHp <= 0) {
+                    crNewHp = 0;
+                    isDead = true;
+                }
+
+                await updateDoc(doc(db, 'games', gameId, 'characters', attacker.id), { 
+                    hp: crNewHp,
+                    agility: 4,
+                    moveRange: 2
+                });
+                
+                if (typeof triggerCombatText === 'function') await triggerCombatText(attacker, `-20`, 'damage');
+                
+                if (isDead) {
+                    await logAction(`💀 ${attacker.name}이(가) 반동을 버티지 못하고 쓰러졌습니다...`, "damage");
+                } else {
+                    await logAction(`🩸 ${attacker.name}이(가) 심문의 대가로 체력 20을 잃고, 스탯이 영구적으로 하락했습니다.`, "damage");
+                }
             }
+            // ▲▲▲ 패널티 처리 로직 끝 ▲▲▲
 
             actionSucceeded = true;
         }
